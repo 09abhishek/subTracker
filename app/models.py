@@ -22,10 +22,7 @@ class LedgerResponse(BaseModel):
     message: str
     status: str
 
-
-# Add this to your models section
 class BalanceResponse(BaseModel):
-    # User details
     email: str
     phone: str
     full_name: str
