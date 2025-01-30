@@ -26,8 +26,6 @@ class BalanceResponse(BaseModel):
     email: str
     phone: str
     full_name: str
-
-    # Account details
     account_name: str
     current_balance: Decimal = Field(decimal_places=2)
     model_config = ConfigDict(from_attributes=True)
@@ -135,7 +133,7 @@ class UserResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-
+# Token Models
 class Token(BaseModel):
     access_token: str
     refresh_token: str
