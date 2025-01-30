@@ -6,7 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import mysql.connector
 from app.db import get_db
 from app.logger import logger
-
+from app.category_matcher import CategoryMatcher
+from typing import List  # Add this for the list type hint
+from mysql.connector.cursor_cext import CMySQLCursor as MySQLCursor  # This is the concrete cursor class
 
 async def process_transactions(
         transactions: list,
@@ -154,48 +156,13 @@ async def process_transactions(
             cursor.close()
 
 
-def determine_category(account: str, trans_type: str) -> int:
-    """Map ledger account to category ID"""
-    category_mappings = {
-        "income": {
-            "Salary": 1,
-            "MF": 2,
-            "Investment": 2,
-            "Freelance": 3,
-            "Other": 4
-        },
-        "expense": {
-            "Food": 5,
-            "Grocery": 5,
-            "Dining": 5,
-            "Utilities": 6,
-            "Electricity": 6,
-            "Internet": 6,
-            "Transport": 7,
-            "Fuel": 7,
-            "Health": 8,
-            "Pharmacy": 8,
-            "Shopping": 9,
-            "EMI": 10,
-            "Loan": 10,
-            "Investment": 11
-        }
-    }
-
-    account_parts = account.split(':')
-
-    for part in account_parts:
-        for category, id in category_mappings[trans_type].items():
-            if category.lower() in part.lower():
-                return id
-
-    return 4 if trans_type == "income" else 9
-
-def parse_ledger_entries(ledger_text: str) -> list:
+def parse_ledger_entries(ledger_text: str, db_cursor: MySQLCursor) -> list:
     """Parse .ledger file into structured JSON format"""
     transactions = []
     lines = ledger_text.splitlines()
 
+    # Initialize CategoryMatcher
+    matcher = CategoryMatcher(db_cursor)
     current_transaction = None
     current_accounts = []
     current_amount = None
@@ -211,6 +178,16 @@ def parse_ledger_entries(ledger_text: str) -> list:
             if current_transaction and len(current_accounts) == 2:
                 trans_type = "income" if "Income:" in current_accounts[1] else "expense"
 
+                # Use CategoryMatcher to determine category
+                description = current_transaction["description"]
+                account = current_accounts[1] if trans_type == "income" else current_accounts[0]
+
+                category_id = matcher.match_category(
+                    description=description,
+                    account=account,
+                    trans_type=trans_type
+                )[0]  # Get just the category_id from the tuple
+
                 transactions.append({
                     "date": current_transaction["date"],
                     "description": current_transaction["description"],
@@ -218,10 +195,7 @@ def parse_ledger_entries(ledger_text: str) -> list:
                     "amount": float(current_amount),
                     "debit_account": current_accounts[0],
                     "credit_account": current_accounts[1],
-                    "category_id": determine_category(
-                        current_accounts[1] if trans_type == "income" else current_accounts[0],
-                        trans_type
-                    )
+                    "category_id": category_id
                 })
 
             # Parse new transaction header
@@ -257,6 +231,16 @@ def parse_ledger_entries(ledger_text: str) -> list:
     if current_transaction and len(current_accounts) == 2:
         trans_type = "income" if "Income:" in current_accounts[1] else "expense"
 
+        # Use CategoryMatcher for the last transaction
+        description = current_transaction["description"]
+        account = current_accounts[1] if trans_type == "income" else current_accounts[0]
+
+        category_id = matcher.match_category(
+            description=description,
+            account=account,
+            trans_type=trans_type
+        )[0]  # Get just the category_id from the tuple
+
         transactions.append({
             "date": current_transaction["date"],
             "description": current_transaction["description"],
@@ -264,10 +248,7 @@ def parse_ledger_entries(ledger_text: str) -> list:
             "amount": float(current_amount),
             "credit_account": current_accounts[0],
             "debit_account": current_accounts[1],
-            "category_id": determine_category(
-                current_accounts[1] if trans_type == "income" else current_accounts[0],
-                trans_type
-            )
+            "category_id": category_id
         })
 
     logger.debug(f"Parsed transactions: {transactions}")

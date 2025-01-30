@@ -1,191 +1,233 @@
-from decimal import Decimal
-from typing import List, Annotated, Optional, Dict, Tuple
-import mysql.connector
+import re
+import logging
+from typing import List, Dict, Tuple
+
+# Example: from mysql.connector.cursor import MySQLCursor
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter("%(levelname)s:%(name)s: %(message)s"))
+    logger.addHandler(console)
+
 
 class CategoryMatcher:
     """
-    Enhanced category matching system that uses database categories and synonym matching
-    to accurately map transaction descriptions to category IDs.
+    A cleaner CategoryMatcher that:
+      - Loads categories once
+      - Uses word-level overlap instead of substring matching
+      - Logs each step clearly
+      - Falls back to 'Shopping' (expense) or 'Other Income' (income) if no good match
     """
 
-    def __init__(self, db_cursor: mysql.connector.MySQLConnection):
+    def __init__(self, db_cursor):
+        """
+        :param db_cursor: A live DB cursor to access the 'categories' table
+        """
+        logger.info("Initializing CategoryMatcher ...")
         self.cursor = db_cursor
-        # Load categories from DB immediately
         self.categories = self._load_categories()
-        self.category_keywords = self._initialize_keyword_mappings()
+        self.category_keywords = self._initialize_keywords()
+
+        logger.debug("Categories loaded (ID -> Name, Type):")
+        for c_id, cat in self.categories.items():
+            logger.debug(f"  {c_id} -> {cat['name']} ({cat['type']})")
+
+        logger.info(f"CategoryMatcher ready with {len(self.categories)} categories.\n")
 
     def _load_categories(self) -> Dict[int, Dict]:
-        """Load categories from database into a dictionary"""
-        self.cursor.execute("""
-            SELECT id, name, type, description 
-            FROM categories 
-            ORDER BY id
-        """)
-        return {
-            row[0]: {
-                'id': row[0],
-                'name': row[1],
-                'type': row[2],
-                'description': row[3]
-            }
-            for row in self.cursor.fetchall()
-        }
+        """
+        Load all categories from DB.  Expects columns: id, name, type, description
+        Returns a dict: { category_id: { "id", "name", "type", "description" }, ... }
+        """
+        query = """SELECT id, name, type, description FROM categories ORDER BY id"""
+        self.cursor.execute(query)
+        rows = self.cursor.fetchall()
 
-    def _initialize_keyword_mappings(self) -> Dict[int, List[str]]:
-        """Initialize keyword mappings for each category ID"""
-        mappings = {}
+        categories = {}
+        if rows and isinstance(rows[0], dict):
+            # Some DB drivers return dict-like rows
+            for row in rows:
+                c_id = row["id"]
+                categories[c_id] = {
+                    "id": c_id,
+                    "name": row["name"],
+                    "type": row["type"],
+                    "description": row["description"],
+                }
+        else:
+            # Tuple-based rows (id, name, type, desc)
+            for row in rows:
+                c_id, name, ctype, desc = row
+                categories[c_id] = {
+                    "id": c_id,
+                    "name": name,
+                    "type": ctype,
+                    "description": desc,
+                }
 
-        # Common keywords for each category type
+        return categories
+
+    def _initialize_keywords(self) -> Dict[int, List[str]]:
+        """
+        Build a list of keywords for each category (including synonyms).
+        We'll do word-level matching, so we just store lists of words.
+        """
+        # Predefined synonyms based on category name patterns
         keyword_patterns = {
-            # Income categories
-            'Salary': ['salary', 'wages', 'pay', 'payroll', 'employment'],
-            'Investment Returns': ['investment return', 'mutual fund', 'mf', 'returns', 'dividend', 'interest'],
-            'Freelance': ['freelance', 'contract', 'consulting', 'project', 'gig'],
-            'Other Income': ['other', 'miscellaneous', 'misc'],
-            'Deposit': ['deposit', 'cash deposit', 'bank deposit'],
-
-            # Expense categories
-            'Food & Dining': [
-                'grocery', 'groceries', 'food', 'dining', 'restaurant',
-                'swiggy', 'zomato', 'supermarket', 'mart', 'bazaar'
+            "Salary": ["salary", "wages", "pay", "payroll", "employment"],
+            "Investment Returns": ["investment return", "mutual fund", "mf", "returns", "dividend", "interest"],
+            "Freelance": ["freelance", "contract", "consulting", "project", "gig"],
+            "Other Income": ["other", "miscellaneous", "misc"],
+            "Deposit": ["deposit", "cash deposit", "bank deposit"],
+            "Food & Dining": [
+                "grocery", "groceries", "food", "dining", "restaurant",
+                "swiggy", "zomato", "supermarket", "mart", "bazaar"
             ],
-            'Utilities': [
-                'electricity', 'electric', 'power', 'utility', 'utilities',
-                'internet', 'broadband', 'water', 'gas', 'bill payment'
+            "Utilities": [
+                "electricity", "electric", "power", "utility", "utilities",
+                "internet", "broadband", "water", "gas", "bill payment"
             ],
-            'Transportation': [
-                'transport', 'fuel', 'petrol', 'diesel', 'gas', 'metro',
-                'bus', 'taxi', 'uber', 'ola', 'travel'
+            "Transportation": [
+                "transport", "fuel", "petrol", "diesel", "gas", "metro",
+                "bus", "taxi", "uber", "ola", "travel", "transportation"
             ],
-            'Health': [
-                'health', 'medical', 'doctor', 'hospital', 'pharmacy',
-                'medicine', 'healthcare', 'clinic', 'prescription'
+            "Health": [
+                "health", "medical", "doctor", "hospital", "pharmacy",
+                "medicine", "healthcare", "clinic", "prescription", "fitness", "gym"
             ],
-            'Shopping': [
-                'shopping', 'purchase', 'store', 'retail', 'amazon',
-                'flipkart', 'mall', 'market', 'buy'
+            "Shopping": [
+                "shopping", "purchase", "store", "retail", "amazon",
+                "flipkart", "mall", "market", "buy", "online", "shop"
             ],
-            'EMI & Payments': [
-                'emi', 'loan', 'payment', 'credit card', 'mortgage',
-                'debt', 'installment', 'finance'
+            "EMI & Payments": [
+                "emi", "loan", "payment", "credit card", "mortgage",
+                "debt", "installment", "finance", "insurance"
             ],
-            'Investment': [
-                'investment', 'invest', 'mutual fund', 'mf', 'stocks',
-                'shares', 'securities', 'sip', 'portfolio'
+            "Investment": [
+                "investment", "invest", "mutual fund", "mf", "stocks",
+                "shares", "securities", "sip", "portfolio", "redeemed"
             ],
-            'Entertainment': [
-                'entertainment', 'movie', 'theatre', 'recreation',
-                'game', 'sports', 'leisure', 'fun'
+            "Entertainment": [
+                "entertainment", "movie", "theatre", "recreation",
+                "game", "sports", "leisure", "fun"
             ],
-            'Internal Transfer': ['transfer', 'mov', 'internal', 'account transfer']
+            "Internal Transfer": ["transfer", "mov", "internal", "account transfer"]
         }
 
-        # Map keywords to category IDs based on name matching
-        for cat_id, category in self.categories.items():
-            cat_name = category['name']
-            keywords = []
+        cat_keywords = {}
+        for c_id, info in self.categories.items():
+            name = info["name"].strip().lower()
+            desc = (info["description"] or "").strip().lower()
 
-            # Add the category name itself as a keyword
-            keywords.append(cat_name.lower())
+            # Start with name-based words
+            # e.g. "Food & Dining" -> ["food", "&", "dining"] if we do simple .split()
+            # But we might want to remove punctuation:
+            words = self._clean_text(name).split()
 
-            # Add words from the category name
-            keywords.extend(cat_name.lower().split())
+            # Add description words, if any
+            if desc:
+                words += self._clean_text(desc).split()
 
-            # Add words from the description
-            if category['description']:
-                keywords.extend(category['description'].lower().split())
+            # If there's a pattern that matches the category name exactly, add them
+            for pattern_name, synonyms in keyword_patterns.items():
+                if pattern_name.lower() in name:
+                    # e.g. name="Food & Dining" matches "Food & Dining"
+                    # so we add ["food", "dining", "restaurant", ...]
+                    extra_words = []
+                    for s in synonyms:
+                        # We'll also clean the synonyms so we consistently compare
+                        extra_words += self._clean_text(s).split()
+                    words += extra_words
 
-            # Add predefined keywords if they exist for this category
-            for pattern, pattern_keywords in keyword_patterns.items():
-                if pattern.lower() in cat_name.lower():
-                    keywords.extend(pattern_keywords)
+            # Remove duplicates and store
+            cat_keywords[c_id] = list(set(words))
 
-            # Store unique keywords for this category
-            mappings[cat_id] = list(set(keywords))
-
-        return mappings
+        return cat_keywords
 
     def _clean_text(self, text: str) -> str:
-        """Clean and normalize text for matching"""
+        """
+        Lowercase and remove punctuation for simpler word splits.
+        This ensures 'expenses' won't match 'expense' by substring.
+        """
         text = text.lower()
-        text = re.sub(r'[^\w\s]', ' ', text)
-        return ' '.join(text.split())
+        # Replace punctuation with space
+        text = re.sub(r"[^\w\s]+", " ", text)
+        # Collapse multiple spaces
+        return " ".join(text.split())
 
     def _calculate_match_score(self, text: str, category_id: int) -> float:
-        """Calculate match score between text and category keywords"""
-        text = self._clean_text(text)
-        keywords = self.category_keywords.get(category_id, [])
-
-        max_score = 0
-        text_words = set(text.split())
-
-        for keyword in keywords:
-            # Exact keyword match
-            if keyword in text:
-                return 1.0
-
-            # Word-level matching
-            keyword_words = set(keyword.split())
-            if keyword_words & text_words:  # If there's any word overlap
-                score = len(keyword_words & text_words) / max(len(keyword_words), len(text_words))
-                max_score = max(max_score, score)
-
-        return max_score
-
-    def match_category(
-            self,
-            description: str,
-            account: str,
-            trans_type: str,
-            threshold: float = 0.3
-    ) -> Tuple[int, float]:
         """
-        Match transaction to category using description and account
-        Returns tuple of (category_id, confidence_score)
+        Word-level overlap:
+        1) Split text into words
+        2) Compare to the category's known keywords
+        3) Score = number_of_common_words / max( len(category_words), len(text_words) )
         """
-        best_match_id = None
-        best_match_score = 0
+        text_words = set(self._clean_text(text).split())
+        cat_words = set(self.category_keywords.get(category_id, []))
 
-        # Get relevant categories for transaction type
-        relevant_categories = {
-            cat_id: cat for cat_id, cat in self.categories.items()
-            if cat['type'] == trans_type
-        }
+        if not cat_words:
+            return 0.0
 
-        # Combine description and account for matching
+        common = text_words & cat_words
+        if not common:
+            return 0.0
+
+        # Simple overlap ratio
+        overlap_score = len(common) / max(len(cat_words), len(text_words))
+        return overlap_score
+
+    def match_category(self, description: str, account: str, trans_type: str, threshold: float = 0.2) -> Tuple[int, float]:
+        """
+        Determine the best matching category among those with the same type (income/expense).
+        If best score < threshold, fallback to 'Shopping' (if expense) or 'Other Income' (if income).
+        """
+        logger.info(f"Matching category for desc='{description}', acct='{account}', type='{trans_type}'")
+
+        # Combine description + account for more context
         text_to_match = f"{description} {account}"
 
-        for cat_id, category in relevant_categories.items():
-            # Calculate match score
-            score = self._calculate_match_score(text_to_match, cat_id)
+        # Filter categories by matching 'type'
+        relevant = {cid: c for cid, c in self.categories.items() if c["type"] == trans_type}
+        logger.debug(f"Relevant categories: {[c['name'] for c in relevant.values()]}")
 
-            if score > best_match_score:
-                best_match_score = score
-                best_match_id = cat_id
+        best_id = None
+        best_score = 0.0
 
-        # Return default category if no good match
-        if best_match_score < threshold:
-            # Default to "Other Income" (id: 4) or "Shopping" (id: 9)
-            default_id = next(
-                (cat_id for cat_id, cat in self.categories.items()
-                 if cat['name'] in ['Other Income', 'Shopping'] and cat['type'] == trans_type),
-                4 if trans_type == 'income' else 9
-            )
-            return default_id, 0.0
+        for cid in relevant:
+            score = self._calculate_match_score(text_to_match, cid)
+            logger.debug(f"    -> Score for ID={cid} ({self.categories[cid]['name']}): {score:.3f}")
+            if score > best_score:
+                best_score = score
+                best_id = cid
 
-        return best_match_id, best_match_score
+        # Fallback logic if below threshold
+        if best_id is None or best_score < threshold:
+            logger.debug(f"No match above threshold={threshold}; applying fallback.")
+            fallback = None
+            if trans_type.lower() == "expense":
+                # Try to find the "Shopping" category
+                fallback = next(
+                    (cid for cid, cat in self.categories.items()
+                     if cat["type"] == "expense" and cat["name"].lower() == "shopping"),
+                    None
+                )
+            else:
+                # For "income", fallback to "Other Income"
+                fallback = next(
+                    (cid for cid, cat in self.categories.items()
+                     if cat["type"] == "income" and cat["name"].lower() == "other income"),
+                    None
+                )
 
+            # If no such category, pick the first relevant
+            if not fallback and relevant:
+                fallback = next(iter(relevant))
 
-def determine_category(
-        description: str,
-        account: str,
-        trans_type: str,
-        db_cursor: mysql.connector.MySQLConnection
-) -> int:
-    """
-    Enhanced category matching function that uses database categories
-    Returns category ID for the transaction
-    """
-    matcher = CategoryMatcher(db_cursor)
-    category_id, confidence = matcher.match_category(description, account, trans_type)
-    return category_id
+            best_id = fallback
+            best_score = 0.0
+
+        final_name = self.categories[best_id]["name"] if best_id else "Unknown"
+        logger.info(f"Final best match: ID={best_id} ({final_name}), score={best_score:.2f}\n")
+        return best_id, best_score

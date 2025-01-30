@@ -860,16 +860,17 @@ async def upload_ledger_file(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid file format. Please upload a .ledger file"
         )
-
+    cursor = None
     try:
         # Read and parse file
         content = await file.read()
         ledger_text = content.decode('utf-8')
-        transactions = parse_ledger_entries(ledger_text)
+        cursor = db.cursor(dictionary=True, buffered=True)
+        parsed_transactions = parse_ledger_entries(ledger_text, cursor)
 
         # Process transactions
         results = await process_transactions(
-            transactions=transactions,
+            transactions=parsed_transactions,
             user_email=current_user['email'],
             db=db
         )
@@ -922,6 +923,7 @@ async def verify_ledger_file(
 
     Returns categorized transactions and validation messages.
     """
+    cursor = None
     try:
         # Validate file extension
         if not file.filename.endswith('.ledger'):
@@ -930,10 +932,11 @@ async def verify_ledger_file(
                 detail="Invalid file format. Please upload a .ledger file"
             )
 
-        # Read and parse file
         content = await file.read()
         ledger_text = content.decode('utf-8')
-        parsed_transactions = parse_ledger_entries(ledger_text)
+
+        cursor = db.cursor(dictionary=True, buffered=True)
+        parsed_transactions = parse_ledger_entries(ledger_text, cursor)
 
         return parsed_transactions
         # Initialize validator
