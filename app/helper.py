@@ -10,6 +10,8 @@ from typing import List, Annotated, Optional
 from decimal import Decimal
 import mysql.connector
 from mysql.connector import Error as MySQLError
+
+from app.config import ALGORITHM, REFRESH_TOKEN_EXPIRE_DAYS
 from app.db import get_db
 from app.logger import logger
 
@@ -20,10 +22,6 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 if not SECRET_KEY:
     raise ValueError("JWT_SECRET_KEY environment variable is not set")
-
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-REFRESH_TOKEN_EXPIRE_DAYS = 30
 
 # Password hashing configuration
 pwd_context = CryptContext(

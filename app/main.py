@@ -1,19 +1,23 @@
+from decimal import Decimal
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordRequestForm
 from jose import JWTError, jwt
-from datetime import datetime, timedelta, date
-from typing import  List, Annotated, Optional
-from decimal import Decimal
+from datetime import datetime, timedelta
+from typing import List, Annotated, Optional
 import mysql.connector
 from mysql.connector import Error as MySQLError
+from app.config import REFRESH_TOKEN_EXPIRE_DAYS, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.db import get_db
 from app.helper import is_email_taken, is_phone_taken, hash_password, create_bank_account, get_current_user, \
     get_bank_account, get_category_by_id, update_bank_balance, oauth2_scheme, SECRET_KEY, ALGORITHM, authenticate_user, \
-    ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS, store_tokens, create_access_token
+    store_tokens, create_access_token
+from app.ledger_parser import parse_ledger_entries, process_transactions
 from app.logger import logger
-from app.models import BalanceResponse, ExpenseCreate, BalanceUpdate, TransactionType, CategoryBase, UserResponse, \
+from app.models import BalanceResponse, ExpenseCreate, BalanceUpdate, TransactionType, UserResponse, \
     UserCreate, TransactionResponse, TransactionCreate, BankAccountResponse, CategoryResponse, CategoryCreate, Token
+from app.transaction_validator import TransactionValidator
 
 # FastAPI app instance
 app = FastAPI(
@@ -30,6 +34,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register_user(
@@ -231,6 +236,7 @@ async def list_bank_accounts(
     finally:
         if cursor:
             cursor.close()
+
 
 """
     Get the current balance for the authenticated user's primary bank account.
@@ -683,8 +689,6 @@ async def update_account_balance(
             cursor.close()
 
 
-
-
 @app.post("/login", response_model=Token)
 async def login(
         response: Response,
@@ -838,152 +842,6 @@ async def logout(
             cursor.close()
 
 
-async def process_transactions(
-        transactions: list,
-        user_email: str,
-        db: mysql.connector.MySQLConnection = Depends(get_db)
-) -> dict:
-    """
-    Process a list of transactions from the ledger file.
-    Validates balance and creates transaction records.
-
-    Args:
-        transactions: List of transaction dictionaries
-        user_email: Email from JWT token
-        db: Database connection
-
-    Returns:
-        Dict containing successful and failed transactions
-    """
-    cursor = None
-    results = {
-        "successful": [],
-        "failed": [],
-        "total_processed": 0,
-        "total_success": 0,
-        "total_failed": 0
-    }
-
-    try:
-        cursor = db.cursor(dictionary=True)
-
-        # Get user and bank account information
-        cursor.execute("""
-            SELECT u.id as user_id, b.id as bank_account_id, b.current_balance
-            FROM users u
-            JOIN bank_accounts b ON u.id = b.user_id
-            WHERE u.email = %s
-            ORDER BY b.created_at ASC
-            LIMIT 1
-        """, (user_email,))
-
-        user_info = cursor.fetchone()
-        if not user_info:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User or bank account not found"
-            )
-
-        # Start transaction
-        cursor.execute("START TRANSACTION")
-
-        # Convert current balance to Decimal
-        current_balance = user_info['current_balance']  # Already Decimal from MySQL
-
-        # Process each transaction
-        for tx in transactions:
-            results['total_processed'] += 1
-
-            try:
-                # Convert amount to Decimal
-                tx_amount = Decimal(str(tx['amount']))
-
-                # Calculate new balance
-                amount = tx_amount if tx['type'] == 'income' else -tx_amount
-                new_balance = current_balance + amount
-
-                # For expenses, verify sufficient balance
-                if tx['type'] == 'expense' and new_balance < 0:
-                    raise ValueError(
-                        f"Insufficient balance for transaction: {tx['description']}. "
-                        f"Required: {tx_amount}, Available: {current_balance}"
-                    )
-
-                # Insert transaction record
-                cursor.execute("""
-                    INSERT INTO transactions (
-                        user_id,
-                        bank_account_id,
-                        category_id,
-                        date,
-                        description,
-                        amount,
-                        type,
-                        debit_account,
-                        credit_account,
-                        source
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'import')
-                """, (
-                    user_info['user_id'],
-                    user_info['bank_account_id'],
-                    tx['category_id'],
-                    tx['date'],
-                    tx['description'],
-                    str(amount),  # Convert Decimal to string for MySQL
-                    tx['type'],
-                    tx['debit_account'],
-                    tx['credit_account']
-                ))
-
-                # Update current balance
-                current_balance = new_balance
-
-                # Add to successful transactions
-                tx['status'] = 'success'
-                tx['processed_amount'] = str(amount)  # Include processed amount in response
-                results['successful'].append(tx)
-                results['total_success'] += 1
-
-            except Exception as e:
-                # Add to failed transactions with error message
-                tx['status'] = 'failed'
-                tx['error'] = str(e)
-                results['failed'].append(tx)
-                results['total_failed'] += 1
-                logger.error(f"Failed to process transaction: {tx['description']}, Error: {str(e)}")
-
-        # Update final balance if there were any successful transactions
-        if results['successful']:
-            cursor.execute("""
-                UPDATE bank_accounts 
-                SET current_balance = %s,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-            """, (str(current_balance), user_info['bank_account_id']))  # Convert Decimal to string
-
-        # Commit transaction if any were successful
-        if results['total_success'] > 0:
-            cursor.execute("COMMIT")
-            logger.info(f"Successfully processed {results['total_success']} transactions")
-        else:
-            cursor.execute("ROLLBACK")
-            logger.warning("No transactions were processed successfully, rolling back")
-
-        return results
-
-    except Exception as e:
-        if cursor:
-            cursor.execute("ROLLBACK")
-        logger.error(f"Error processing transactions: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing transactions: {str(e)}"
-        )
-    finally:
-        if cursor:
-            cursor.close()
-
-
 @app.post("/upload-ledger")
 async def upload_ledger_file(
         file: UploadFile = File(...),
@@ -1050,127 +908,128 @@ async def upload_ledger_file(
         )
 
 
-def determine_category(account: str, trans_type: str) -> int:
-    """Map ledger account to category ID"""
-    category_mappings = {
-        "income": {
-            "Salary": 1,
-            "MF": 2,
-            "Investment": 2,
-            "Freelance": 3,
-            "Other": 4
-        },
-        "expense": {
-            "Food": 5,
-            "Grocery": 5,
-            "Dining": 5,
-            "Utilities": 6,
-            "Electricity": 6,
-            "Internet": 6,
-            "Transport": 7,
-            "Fuel": 7,
-            "Health": 8,
-            "Pharmacy": 8,
-            "Shopping": 9,
-            "EMI": 10,
-            "Loan": 10,
-            "Investment": 11
-        }
-    }
+@app.post("/verify-file")
+async def verify_ledger_file(
+        file: UploadFile = File(...),
+        current_user: dict = Depends(get_current_user),
+        db: mysql.connector.MySQLConnection = Depends(get_db)
+):
+    """
+    Verify a ledger file before processing:
+    1. Check for repeated transactions within the file
+    2. Validate transaction feasibility based on account balance
+    3. Check for existing transactions in database
 
-    account_parts = account.split(':')
-
-    for part in account_parts:
-        for category, id in category_mappings[trans_type].items():
-            if category.lower() in part.lower():
-                return id
-
-    return 4 if trans_type == "income" else 9
-
-
-def parse_ledger_entries(ledger_text: str) -> list:
-    """Parse .ledger file into structured JSON format"""
-    transactions = []
-    lines = ledger_text.splitlines()
-
-    current_transaction = None
-    current_accounts = []
-    current_amount = None
-
-    for line in lines:
-        # Skip empty lines
-        if not line.strip():
-            continue
-
-        # New transaction starts with a date
-        if line[0].isdigit():
-            # Save previous transaction if exists
-            if current_transaction and len(current_accounts) == 2:
-                trans_type = "income" if "Income:" in current_accounts[1] else "expense"
-
-                transactions.append({
-                    "date": current_transaction["date"],
-                    "description": current_transaction["description"],
-                    "type": trans_type,
-                    "amount": float(current_amount),
-                    "debit_account": current_accounts[0],
-                    "credit_account": current_accounts[1],
-                    "category_id": determine_category(
-                        current_accounts[1] if trans_type == "income" else current_accounts[0],
-                        trans_type
-                    )
-                })
-
-            # Parse new transaction header
-            date_str = line[:10]
-            description = line[10:].strip()
-
-            current_transaction = {
-                "date": datetime.strptime(date_str, '%Y/%m/%d').strftime('%Y-%m-%d'),
-                "description": description
-            }
-            current_accounts = []
-            current_amount = None
-
-        # Parse account postings
-        elif line.startswith(' ') and current_transaction:
-            parts = [p.strip() for p in line.split('  ') if p.strip()]
-
-            if not parts:
-                continue
-
-            account = parts[0]
-            current_accounts.append(account)
-
-            # Extract amount if present
-            if len(parts) > 1:
-                amount_str = parts[-1].replace('₹', '').replace(',', '')
-                try:
-                    current_amount = float(amount_str)
-                except ValueError:
-                    pass
-
-    # Don't forget the last transaction
-    if current_transaction and len(current_accounts) == 2:
-        trans_type = "income" if "Income:" in current_accounts[1] else "expense"
-
-        transactions.append({
-            "date": current_transaction["date"],
-            "description": current_transaction["description"],
-            "type": trans_type,
-            "amount": float(current_amount),
-            "credit_account": current_accounts[0],
-            "debit_account": current_accounts[1],
-            "category_id": determine_category(
-                current_accounts[1] if trans_type == "income" else current_accounts[0],
-                trans_type
+    Returns categorized transactions and validation messages.
+    """
+    try:
+        # Validate file extension
+        if not file.filename.endswith('.ledger'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid file format. Please upload a .ledger file"
             )
-        })
 
-    logger.debug(f"Parsed transactions: {transactions}")
-    return transactions
+        # Read and parse file
+        content = await file.read()
+        ledger_text = content.decode('utf-8')
+        parsed_transactions = parse_ledger_entries(ledger_text)
 
+        return parsed_transactions
+        # Initialize validator
+        with TransactionValidator(db, current_user['id']) as validator:
+            # Get user's bank account info
+            user_info = validator.get_user_balance(current_user['email'])
+            if not user_info:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User or bank account not found"
+                )
 
+            # Find repeated transactions
+            repeated_transactions, unique_transactions = validator.find_repeated_transactions(parsed_transactions)
+
+            # Initialize result containers
+            current_balance = Decimal(str(user_info['current_balance']))
+            existing_in_db = []
+            processable_transactions = []
+            unprocessable_transactions = []
+
+            # Validate each unique transaction
+            for tx in unique_transactions:
+                # Convert amount to Decimal
+                tx_amount = Decimal(str(tx['amount']))
+
+                # Check if transaction exists in DB
+                if validator.check_existing_transactions(tx['date'], tx_amount):
+                    existing_in_db.append({
+                        **tx,
+                        "validation_message": "Transaction already exists in database"
+                    })
+                    continue
+
+                # Calculate balance impact
+                amount = tx_amount if tx['type'] == 'income' else -tx_amount
+                new_balance = current_balance + amount
+
+                # Validate based on transaction type and balance
+                if tx['type'] == 'expense' and new_balance < 0:
+                    unprocessable_transactions.append({
+                        **tx,
+                        "validation_message": (
+                            f"Insufficient balance for expense. "
+                            f"Required: {abs(amount)}, "
+                            f"Available: {current_balance}"
+                        )
+                    })
+                else:
+                    processable_transactions.append({
+                        **tx,
+                        "validation_message": "Transaction is valid and can be processed",
+                        "projected_balance": new_balance
+                    })
+                    current_balance = new_balance
+
+        # Prepare detailed response
+        validation_summary = {
+            "total_entries": len(parsed_transactions),
+            "repeated_entries": len(repeated_transactions),
+            "existing_in_db": len(existing_in_db),
+            "processable": len(processable_transactions),
+            "unprocessable": len(unprocessable_transactions)
+        }
+
+        account_info = {
+            "account_name": user_info['account_name'],
+            "current_balance": str(user_info['current_balance']),
+            "projected_balance": str(current_balance),
+            "total_impact": str(current_balance - Decimal(str(user_info['current_balance'])))
+        }
+
+        return {
+            "message": "File verification completed",
+            "account_info": account_info,
+            "validation_summary": validation_summary,
+            "validation_details": {
+                "repeated_transactions": repeated_transactions,
+                "existing_in_db": existing_in_db,
+                "processable_transactions": processable_transactions,
+                "unprocessable_transactions": unprocessable_transactions
+            }
+        }
+
+    except UnicodeDecodeError:
+        logger.error("File decoding error")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File encoding error. Please ensure the file is UTF-8 encoded"
+        )
+    except Exception as e:
+        logger.error(f"Error verifying file: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error verifying file: {str(e)}"
+        )
 
 
 @app.get("/")
