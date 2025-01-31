@@ -1,19 +1,26 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Response
+from decimal import Decimal
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from datetime import datetime, timedelta, date
-from typing import  List, Annotated, Optional
-from decimal import Decimal
+from typing import List, Annotated, Optional, Dict, Any
 import mysql.connector
 from mysql.connector import Error as MySQLError
+from pydantic import BaseModel
+
+from app.config import REFRESH_TOKEN_EXPIRE_DAYS, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.db import get_db
 from app.helper import is_email_taken, is_phone_taken, hash_password, create_bank_account, get_current_user, \
     get_bank_account, get_category_by_id, update_bank_balance, oauth2_scheme, SECRET_KEY, ALGORITHM, authenticate_user, \
-    ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS, store_tokens, create_access_token
+    store_tokens, create_access_token
+from app.ledger_parser import parse_ledger_entries, process_transactions
 from app.logger import logger
-from app.models import BalanceResponse, ExpenseCreate, BalanceUpdate, TransactionType, CategoryBase, UserResponse, \
-    UserCreate, TransactionResponse, TransactionCreate, BankAccountResponse, CategoryResponse, CategoryCreate, Token
+from app.models import BalanceResponse, ExpenseCreate, BalanceUpdate, TransactionType, UserResponse, \
+    UserCreate, TransactionResponse, TransactionCreate, BankAccountResponse, CategoryResponse, CategoryCreate, Token, \
+    TransactionDateRangeResponse
+from app.transaction_validator import TransactionValidator
 
 # FastAPI app instance
 app = FastAPI(
@@ -30,6 +37,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register_user(
@@ -53,10 +61,10 @@ async def register_user(
         hashed_password = hash_password(user.password)
         cursor = db.cursor(dictionary=True)
 
-        # Start transaction
+        # Starting db transaction
         cursor.execute("START TRANSACTION")
 
-        # Insert user
+        # Inserting user
         cursor.execute("""
             INSERT INTO users (email, phone, password_hash, full_name)
             VALUES (%s, %s, %s, %s)
@@ -64,13 +72,13 @@ async def register_user(
 
         user_id = cursor.lastrowid
 
-        # Create default bank account
+        # Creating a default bank account/wallet
         create_bank_account(cursor, user_id, user.bank_name)
 
-        # Commit transaction
+        # Commiting the transaction
         cursor.execute("COMMIT")
 
-        # Fetch created user
+        # Fetching created user
         cursor.execute("""
             SELECT id, email, phone, full_name, created_at
             FROM users WHERE id = %s
@@ -102,7 +110,7 @@ async def create_transaction(
     try:
         cursor = db.cursor(dictionary=True)
 
-        # Verify bank account belongs to user
+        # Verifying bank account belongs to user
         bank_account = get_bank_account(cursor, transaction.bank_account_id, current_user["id"])
         if not bank_account:
             raise HTTPException(
@@ -110,7 +118,7 @@ async def create_transaction(
                 detail="Bank account not found"
             )
 
-        # Verify category exists
+        # Verifying category exists
         category = get_category_by_id(cursor, transaction.category_id)
         if not category:
             raise HTTPException(
@@ -118,10 +126,10 @@ async def create_transaction(
                 detail="Category not found"
             )
 
-        # Start transaction
+        # Starting db transaction
         cursor.execute("START TRANSACTION")
 
-        # Create transaction
+        # Creating db transaction
         cursor.execute("""
             INSERT INTO transactions 
                 (user_id, bank_account_id, category_id, date, description, amount, source)
@@ -139,13 +147,13 @@ async def create_transaction(
 
         transaction_id = cursor.lastrowid
 
-        # Update bank account balance
+        # Updating bank account balance
         update_bank_balance(cursor, transaction.bank_account_id, transaction.amount)
 
-        # Commit transaction
+        # Commit db transaction
         cursor.execute("COMMIT")
 
-        # Fetch created transaction
+        # Fetching inserted transaction
         cursor.execute("""
             SELECT * FROM transactions WHERE id = %s
         """, (transaction_id,))
@@ -232,6 +240,7 @@ async def list_bank_accounts(
         if cursor:
             cursor.close()
 
+
 """
     Get the current balance for the authenticated user's primary bank account.
     Requires a valid JWT token in the Authorization header.
@@ -306,10 +315,9 @@ async def create_expense_transaction(
     try:
         cursor = db.cursor(dictionary=True)
 
-        # Start transaction
         cursor.execute("START TRANSACTION")
 
-        # 1. Get user's bank account and verify sufficient balance
+        # checking user's bank account and verify sufficient balance
         cursor.execute("""
             SELECT id, current_balance 
             FROM bank_accounts 
@@ -326,7 +334,7 @@ async def create_expense_transaction(
                 detail="No bank account found for user"
             )
 
-        # 2. Verify category exists and is an expense category
+        # Verifying category exists and is an expense category
         cursor.execute("""
             SELECT id, type 
             FROM categories 
@@ -340,7 +348,7 @@ async def create_expense_transaction(
                 detail="Invalid expense category"
             )
 
-        # 3. Check if sufficient balance available
+        # Checking if sufficient balance available
         expense_amount = abs(expense.amount) * -1  # Convert to negative for expense
         new_balance = bank_account['current_balance'] + expense_amount
 
@@ -355,7 +363,7 @@ async def create_expense_transaction(
                 }
             )
 
-        # 4. Create the transaction record
+        # Inserting transaction record
         cursor.execute("""
             INSERT INTO transactions 
                 (user_id, bank_account_id, category_id, date, description, amount, source)
@@ -372,7 +380,7 @@ async def create_expense_transaction(
 
         transaction_id = cursor.lastrowid
 
-        # 5. Update bank account balance
+        # Updating bank account balance
         cursor.execute("""
             UPDATE bank_accounts 
             SET current_balance = current_balance + %s,
@@ -380,10 +388,9 @@ async def create_expense_transaction(
             WHERE id = %s
         """, (expense_amount, bank_account["id"]))
 
-        # 6. Commit the transaction
         cursor.execute("COMMIT")
 
-        # 7. Fetch and return the created transaction
+        # Return the created transaction
         cursor.execute("""
             SELECT t.*, c.type as category_type, c.name as category_name,
                    ba.current_balance as updated_balance
@@ -419,24 +426,24 @@ async def setup_default_categories(
         (2, "Investment Returns", "income", "Returns from mutual funds and investments"),
         (3, "Freelance", "income", "Freelance and project-based income"),
         (4, "Other Income", "income", "Miscellaneous income"),
-        (5, "Food & Dining", "expense", "Groceries and restaurants"),
-        (6, "Utilities", "expense", "Electricity, internet, and bills"),
-        (7, "Transportation", "expense", "Fuel and travel expenses"),
-        (8, "Health", "expense", "Medical and pharmacy expenses"),
-        (9, "Shopping", "expense", "Online and offline shopping"),
-        (10, "EMI & Payments", "expense", "Loan EMIs and credit card payments"),
-        (11, "Investment", "expense", "Mutual funds and investments"),
-        (12, "Internal Transfer", "transfer", "Account transfers")
+        (5, "Deposit", "income", "Cash deposit to self account"),
+        (6, "Food & Dining", "expense", "Groceries and restaurants"),
+        (7, "Utilities", "expense", "Electricity, internet, and bills"),
+        (8, "Transportation", "expense", "Fuel and travel expenses"),
+        (9, "Health", "expense", "Medical and pharmacy expenses"),
+        (10, "Shopping", "expense", "Online and offline shopping"),
+        (11, "EMI & Payments", "expense", "Loan EMIs and credit card payments"),
+        (12, "Investment", "expense", "Mutual funds and investments"),
+        (13, "Entertainment", "expense", "Leisure and recreational expenses"),
+        (14, "Internal Transfer", "transfer", "Account transfers")
     ]
 
     cursor = None
     try:
         cursor = db.cursor(dictionary=True)
-
-        # Start transaction
+        # Starting db transaction
         cursor.execute("START TRANSACTION")
-
-        # First, get existing categories
+        # Getting all existing categories
         cursor.execute("SELECT id, name, type FROM categories")
         existing_categories = cursor.fetchall()
         existing_names = {(cat['name'], cat['type']) for cat in existing_categories}
@@ -453,10 +460,10 @@ async def setup_default_categories(
                 """, (name, type_, description))
                 logger.info(f"Added new category: {name} ({type_})")
 
-        # Commit transaction
+        # Commiting the db transaction
         cursor.execute("COMMIT")
 
-        # Fetch all categories
+        # Fetching all categories
         cursor.execute("""
             SELECT * FROM categories 
             ORDER BY type, name
@@ -464,7 +471,7 @@ async def setup_default_categories(
 
         categories = cursor.fetchall()
 
-        # Log category count by type
+        # Printing category count by type
         type_counts = {}
         for cat in categories:
             type_counts[cat['type']] = type_counts.get(cat['type'], 0) + 1
@@ -495,7 +502,7 @@ async def create_category(
     try:
         cursor = db.cursor(dictionary=True)
 
-        # Check if category already exists case-insensitive search
+        # Checking if category already exists case-insensitive search
         cursor.execute("""
             SELECT * FROM categories 
             WHERE LOWER(name) = LOWER(%s) AND type = %s
@@ -505,16 +512,16 @@ async def create_category(
         if existing_category:
             return existing_category  # Return existing category instead of creating new one
 
-        # Create new category only if it doesn't exist
+        # Creating new category only if it doesn't exist
         cursor.execute("""
             INSERT INTO categories (name, type, description)
             VALUES (%s, %s, %s)
         """, (category.name.strip(), category.type, category.description))
 
         category_id = cursor.lastrowid
-        db.commit()  # Commit the transaction
+        db.commit()
 
-        # Fetch and return created category
+        # Fetching and returning the created category
         cursor.execute("SELECT * FROM categories WHERE id = %s", (category_id,))
         new_category = cursor.fetchone()
 
@@ -575,10 +582,10 @@ async def update_account_balance(
     try:
         cursor = db.cursor(dictionary=True)
 
-        # Start transaction
+        # Starting transaction
         cursor.execute("START TRANSACTION")
 
-        # 1. Verify and lock bank account
+        # Checking and lock bank account as transaction
         cursor.execute("""
             SELECT * FROM bank_accounts 
             WHERE id = %s AND user_id = %s 
@@ -592,7 +599,7 @@ async def update_account_balance(
                 detail="Bank account not found or unauthorized access"
             )
 
-        # 2. Verify category exists and matches transaction type
+        # Checking if category exists and matches transaction type
         cursor.execute("""
             SELECT * FROM categories 
             WHERE id = %s AND type = %s
@@ -605,7 +612,7 @@ async def update_account_balance(
                 detail=f"Invalid category for {balance_update.transaction_type} transaction"
             )
 
-        # 3. Check balance for withdrawals
+        # Check balance for withdrawals
         new_balance = account['current_balance'] + balance_update.amount
         if new_balance < 0:
             raise HTTPException(
@@ -618,7 +625,7 @@ async def update_account_balance(
                 }
             )
 
-        # 4. Record the transaction
+        # Inserting into the transaction table
         cursor.execute("""
             INSERT INTO transactions (
                 user_id, 
@@ -649,10 +656,10 @@ async def update_account_balance(
             current_user["id"]
         ))
 
-        # 6. Commit the transaction
+        # Commiting the transaction
         cursor.execute("COMMIT")
 
-        # 7. Fetch and return updated account details
+        # 7. Fetch the updated info and returning the updated account details
         cursor.execute("""
             SELECT 
                 ba.*,
@@ -681,8 +688,6 @@ async def update_account_balance(
     finally:
         if cursor:
             cursor.close()
-
-
 
 
 @app.post("/login", response_model=Token)
@@ -818,13 +823,11 @@ async def logout(
 ):
     try:
         cursor = db.cursor()
-        # Delete all tokens for the user
         cursor.execute(
             "DELETE FROM auth_tokens WHERE user_id = %s",
             (current_user["id"],)
         )
         db.commit()
-
         return {"detail": "Successfully logged out"}
 
     except MySQLError as e:
@@ -832,152 +835,6 @@ async def logout(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error during logout"
-        )
-    finally:
-        if cursor:
-            cursor.close()
-
-
-async def process_transactions(
-        transactions: list,
-        user_email: str,
-        db: mysql.connector.MySQLConnection = Depends(get_db)
-) -> dict:
-    """
-    Process a list of transactions from the ledger file.
-    Validates balance and creates transaction records.
-
-    Args:
-        transactions: List of transaction dictionaries
-        user_email: Email from JWT token
-        db: Database connection
-
-    Returns:
-        Dict containing successful and failed transactions
-    """
-    cursor = None
-    results = {
-        "successful": [],
-        "failed": [],
-        "total_processed": 0,
-        "total_success": 0,
-        "total_failed": 0
-    }
-
-    try:
-        cursor = db.cursor(dictionary=True)
-
-        # Get user and bank account information
-        cursor.execute("""
-            SELECT u.id as user_id, b.id as bank_account_id, b.current_balance
-            FROM users u
-            JOIN bank_accounts b ON u.id = b.user_id
-            WHERE u.email = %s
-            ORDER BY b.created_at ASC
-            LIMIT 1
-        """, (user_email,))
-
-        user_info = cursor.fetchone()
-        if not user_info:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User or bank account not found"
-            )
-
-        # Start transaction
-        cursor.execute("START TRANSACTION")
-
-        # Convert current balance to Decimal
-        current_balance = user_info['current_balance']  # Already Decimal from MySQL
-
-        # Process each transaction
-        for tx in transactions:
-            results['total_processed'] += 1
-
-            try:
-                # Convert amount to Decimal
-                tx_amount = Decimal(str(tx['amount']))
-
-                # Calculate new balance
-                amount = tx_amount if tx['type'] == 'income' else -tx_amount
-                new_balance = current_balance + amount
-
-                # For expenses, verify sufficient balance
-                if tx['type'] == 'expense' and new_balance < 0:
-                    raise ValueError(
-                        f"Insufficient balance for transaction: {tx['description']}. "
-                        f"Required: {tx_amount}, Available: {current_balance}"
-                    )
-
-                # Insert transaction record
-                cursor.execute("""
-                    INSERT INTO transactions (
-                        user_id,
-                        bank_account_id,
-                        category_id,
-                        date,
-                        description,
-                        amount,
-                        type,
-                        debit_account,
-                        credit_account,
-                        source
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'import')
-                """, (
-                    user_info['user_id'],
-                    user_info['bank_account_id'],
-                    tx['category_id'],
-                    tx['date'],
-                    tx['description'],
-                    str(amount),  # Convert Decimal to string for MySQL
-                    tx['type'],
-                    tx['debit_account'],
-                    tx['credit_account']
-                ))
-
-                # Update current balance
-                current_balance = new_balance
-
-                # Add to successful transactions
-                tx['status'] = 'success'
-                tx['processed_amount'] = str(amount)  # Include processed amount in response
-                results['successful'].append(tx)
-                results['total_success'] += 1
-
-            except Exception as e:
-                # Add to failed transactions with error message
-                tx['status'] = 'failed'
-                tx['error'] = str(e)
-                results['failed'].append(tx)
-                results['total_failed'] += 1
-                logger.error(f"Failed to process transaction: {tx['description']}, Error: {str(e)}")
-
-        # Update final balance if there were any successful transactions
-        if results['successful']:
-            cursor.execute("""
-                UPDATE bank_accounts 
-                SET current_balance = %s,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-            """, (str(current_balance), user_info['bank_account_id']))  # Convert Decimal to string
-
-        # Commit transaction if any were successful
-        if results['total_success'] > 0:
-            cursor.execute("COMMIT")
-            logger.info(f"Successfully processed {results['total_success']} transactions")
-        else:
-            cursor.execute("ROLLBACK")
-            logger.warning("No transactions were processed successfully, rolling back")
-
-        return results
-
-    except Exception as e:
-        if cursor:
-            cursor.execute("ROLLBACK")
-        logger.error(f"Error processing transactions: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing transactions: {str(e)}"
         )
     finally:
         if cursor:
@@ -1002,21 +859,19 @@ async def upload_ledger_file(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid file format. Please upload a .ledger file"
         )
-
+    cursor = None
     try:
-        # Read and parse file
         content = await file.read()
         ledger_text = content.decode('utf-8')
-        transactions = parse_ledger_entries(ledger_text)
+        cursor = db.cursor(dictionary=True, buffered=True)
+        parsed_transactions = parse_ledger_entries(ledger_text, cursor)
 
-        # Process transactions
         results = await process_transactions(
-            transactions=transactions,
+            transactions=parsed_transactions,
             user_email=current_user['email'],
             db=db
         )
 
-        # Prepare response message based on results
         message = "File processing completed."
         if results['total_success'] > 0 and results['total_failed'] > 0:
             message = f"Partially successful. {results['total_success']} transactions processed, {results['total_failed']} failed."
@@ -1050,128 +905,259 @@ async def upload_ledger_file(
         )
 
 
-def determine_category(account: str, trans_type: str) -> int:
-    """Map ledger account to category ID"""
-    category_mappings = {
-        "income": {
-            "Salary": 1,
-            "MF": 2,
-            "Investment": 2,
-            "Freelance": 3,
-            "Other": 4
-        },
-        "expense": {
-            "Food": 5,
-            "Grocery": 5,
-            "Dining": 5,
-            "Utilities": 6,
-            "Electricity": 6,
-            "Internet": 6,
-            "Transport": 7,
-            "Fuel": 7,
-            "Health": 8,
-            "Pharmacy": 8,
-            "Shopping": 9,
-            "EMI": 10,
-            "Loan": 10,
-            "Investment": 11
-        }
-    }
+@app.post("/verify-file")
+async def verify_ledger_file(
+        file: UploadFile = File(...),
+        current_user: dict = Depends(get_current_user),
+        db: mysql.connector.MySQLConnection = Depends(get_db)
+):
+    """
+    Verify a ledger file before processing:
+    1. Check for repeated transactions within the file
+    2. Validate transaction feasibility based on account balance
+    3. Check for existing transactions in database
 
-    account_parts = account.split(':')
-
-    for part in account_parts:
-        for category, id in category_mappings[trans_type].items():
-            if category.lower() in part.lower():
-                return id
-
-    return 4 if trans_type == "income" else 9
-
-
-def parse_ledger_entries(ledger_text: str) -> list:
-    """Parse .ledger file into structured JSON format"""
-    transactions = []
-    lines = ledger_text.splitlines()
-
-    current_transaction = None
-    current_accounts = []
-    current_amount = None
-
-    for line in lines:
-        # Skip empty lines
-        if not line.strip():
-            continue
-
-        # New transaction starts with a date
-        if line[0].isdigit():
-            # Save previous transaction if exists
-            if current_transaction and len(current_accounts) == 2:
-                trans_type = "income" if "Income:" in current_accounts[1] else "expense"
-
-                transactions.append({
-                    "date": current_transaction["date"],
-                    "description": current_transaction["description"],
-                    "type": trans_type,
-                    "amount": float(current_amount),
-                    "debit_account": current_accounts[0],
-                    "credit_account": current_accounts[1],
-                    "category_id": determine_category(
-                        current_accounts[1] if trans_type == "income" else current_accounts[0],
-                        trans_type
-                    )
-                })
-
-            # Parse new transaction header
-            date_str = line[:10]
-            description = line[10:].strip()
-
-            current_transaction = {
-                "date": datetime.strptime(date_str, '%Y/%m/%d').strftime('%Y-%m-%d'),
-                "description": description
-            }
-            current_accounts = []
-            current_amount = None
-
-        # Parse account postings
-        elif line.startswith(' ') and current_transaction:
-            parts = [p.strip() for p in line.split('  ') if p.strip()]
-
-            if not parts:
-                continue
-
-            account = parts[0]
-            current_accounts.append(account)
-
-            # Extract amount if present
-            if len(parts) > 1:
-                amount_str = parts[-1].replace('₹', '').replace(',', '')
-                try:
-                    current_amount = float(amount_str)
-                except ValueError:
-                    pass
-
-    # Don't forget the last transaction
-    if current_transaction and len(current_accounts) == 2:
-        trans_type = "income" if "Income:" in current_accounts[1] else "expense"
-
-        transactions.append({
-            "date": current_transaction["date"],
-            "description": current_transaction["description"],
-            "type": trans_type,
-            "amount": float(current_amount),
-            "credit_account": current_accounts[0],
-            "debit_account": current_accounts[1],
-            "category_id": determine_category(
-                current_accounts[1] if trans_type == "income" else current_accounts[0],
-                trans_type
+    Returns categorized transactions and validation messages.
+    """
+    cursor = None
+    try:
+        # Validate file extension
+        if not file.filename.endswith('.ledger'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid file format. Please upload a .ledger file"
             )
-        })
 
-    logger.debug(f"Parsed transactions: {transactions}")
-    return transactions
+        content = await file.read()
+        ledger_text = content.decode('utf-8')
+
+        cursor = db.cursor(dictionary=True, buffered=True)
+        parsed_transactions = parse_ledger_entries(ledger_text, cursor)
+        return parsed_transactions
+
+        with TransactionValidator(db, current_user['id']) as validator:
+            # Get user's bank account info
+            user_info = validator.get_user_balance(current_user['email'])
+            if not user_info:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User or bank account not found"
+                )
+
+            # Checking repeated transactions
+            repeated_transactions, unique_transactions = validator.find_repeated_transactions(parsed_transactions)
+
+            current_balance = Decimal(str(user_info['current_balance']))
+            existing_in_db = []
+            processable_transactions = []
+            unprocessable_transactions = []
+
+            # Validating unique transaction one by one
+            for tx in unique_transactions:
+                # Convert amount to Decimal
+                tx_amount = Decimal(str(tx['amount']))
+
+                # Checking if transaction exists in DB
+                if validator.check_existing_transactions(tx['date'], tx_amount):
+                    existing_in_db.append({
+                        **tx,
+                        "validation_message": "Transaction already exists in database"
+                    })
+                    continue
+
+                # Calculating balance impact here
+                amount = tx_amount if tx['type'] == 'income' else -tx_amount
+                new_balance = current_balance + amount
+
+                # Validating based on transaction type and balance
+                if tx['type'] == 'expense' and new_balance < 0:
+                    unprocessable_transactions.append({
+                        **tx,
+                        "validation_message": (
+                            f"Insufficient balance for expense. "
+                            f"Required: {abs(amount)}, "
+                            f"Available: {current_balance}"
+                        )
+                    })
+                else:
+                    processable_transactions.append({
+                        **tx,
+                        "validation_message": "Transaction is valid and can be processed",
+                        "projected_balance": new_balance
+                    })
+                    current_balance = new_balance
+
+        validation_summary = {
+            "total_entries": len(parsed_transactions),
+            "repeated_entries": len(repeated_transactions),
+            "existing_in_db": len(existing_in_db),
+            "processable": len(processable_transactions),
+            "unprocessable": len(unprocessable_transactions)
+        }
+
+        account_info = {
+            "account_name": user_info['account_name'],
+            "current_balance": str(user_info['current_balance']),
+            "projected_balance": str(current_balance),
+            "total_impact": str(current_balance - Decimal(str(user_info['current_balance'])))
+        }
+
+        return {
+            "message": "File verification completed",
+            "account_info": account_info,
+            "validation_summary": validation_summary,
+            "validation_details": {
+                "repeated_transactions": repeated_transactions,
+                "existing_in_db": existing_in_db,
+                "processable_transactions": processable_transactions,
+                "unprocessable_transactions": unprocessable_transactions
+            }
+        }
+
+    except UnicodeDecodeError:
+        logger.error("File decoding error")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File encoding error. Please ensure the file is UTF-8 encoded"
+        )
+    except Exception as e:
+        logger.error(f"Error verifying file: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error verifying file: {str(e)}"
+        )
 
 
+@app.get("/transactions/by-date", response_model=TransactionDateRangeResponse)
+async def get_transactions_by_date_range(
+        from_date: str = Query(..., description="Start date in DD/MM/YYYY format"),
+        to_date: str = Query(..., description="End date in DD/MM/YYYY format"),
+        transaction_type: Optional[TransactionType] = None,
+        current_user: dict = Depends(get_current_user),
+        db: mysql.connector.MySQLConnection = Depends(get_db)
+):
+    """
+    Get all transactions within a date range for the authenticated user's bank account.
+    Returns both summary statistics and detailed transaction data.
+    """
+    cursor = None
+    try:
+        try:
+            start_date = datetime.strptime(from_date, '%d/%m/%Y').strftime('%Y-%m-%d')
+            end_date = datetime.strptime(to_date, '%d/%m/%Y').strftime('%Y-%m-%d')
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid date format. Please use DD/MM/YYYY format"
+            )
 
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT id, account_name, current_balance 
+            FROM bank_accounts 
+            WHERE user_id = %s
+            ORDER BY created_at ASC
+            LIMIT 1
+        """, (current_user["id"],))
+
+        bank_account = cursor.fetchone()
+
+        print("=========================")
+        print(bank_account)
+
+        if not bank_account:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No bank account found for user"
+            )
+        query = """
+            SELECT 
+                t.*,
+                c.name as category_name,
+                c.type as category_type,
+                c.description as category_description,
+                ba.account_name,
+                ba.account_type,
+                ba.currency
+            FROM transactions t
+            JOIN categories c ON t.category_id = c.id
+            JOIN bank_accounts ba ON t.bank_account_id = ba.id
+            WHERE t.user_id = %s
+            AND t.bank_account_id = %s
+            AND t.date BETWEEN %s AND %s
+        """
+        params = [current_user["id"], bank_account["id"], start_date, end_date]
+
+        if transaction_type:
+            query += " AND t.type = %s"
+            params.append(transaction_type)
+
+        query += " ORDER BY t.date DESC, t.id DESC"
+
+        cursor.execute(query, params)
+        transactions = cursor.fetchall()
+
+        # Converting Decimal values to strings in transactions
+        processed_transactions = []
+        for transaction in transactions:
+            processed_transaction = {}
+            for key, value in transaction.items():
+                if isinstance(value, Decimal):
+                    processed_transaction[key] = str(value)
+                elif isinstance(value, datetime):
+                    processed_transaction[key] = value.strftime('%Y-%m-%d %H:%M:%S')
+                elif isinstance(value, date):
+                    processed_transaction[key] = value.strftime('%Y-%m-%d')
+                else:
+                    processed_transaction[key] = value
+            processed_transactions.append(processed_transaction)
+
+        summary = {
+            'date_range': {
+                'from': from_date,
+                'to': to_date
+            },
+            'account_details': {
+                'account_name': bank_account['account_name'],
+                'current_balance': str(bank_account['current_balance']),
+                'account_id': bank_account['id']
+            },
+            'transaction_statistics': {
+                'total_income': str(sum(t['amount'] for t in transactions if t['type'] == 'income')),
+                'total_expense': str(abs(sum(t['amount'] for t in transactions if t['type'] == 'expense'))),
+                'total_transfers': str(sum(t['amount'] for t in transactions if t['type'] == 'transfer')),
+                'transaction_count': len(transactions)
+            }
+        }
+
+        # Category-wise totals
+        category_totals = {}
+        for transaction in transactions:
+            category = transaction['category_name']
+            amount = transaction['amount']
+            if category not in category_totals:
+                category_totals[category] = Decimal('0')
+            category_totals[category] += amount
+
+        summary['category_totals'] = {
+            category: str(total)
+            for category, total in category_totals.items()
+        }
+
+        return {
+            "summary": summary,
+            "transactions": processed_transactions
+        }
+
+    except MySQLError as e:
+        logger.error(f"Database error in get_transactions_by_date_range: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
+    finally:
+        if cursor:
+            cursor.close()
 
 @app.get("/")
 async def read_root(current_user: dict = Depends(get_current_user)):

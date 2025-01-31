@@ -1,6 +1,6 @@
 from enum import Enum
 from pydantic import BaseModel, ConfigDict, Field, EmailStr
-from typing import List, Annotated
+from typing import List, Annotated, Dict, Any
 from datetime import datetime
 from datetime import date
 from decimal import Decimal
@@ -111,6 +111,10 @@ class TransactionResponse(TransactionBase):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+class TransactionDateRangeResponse(BaseModel):
+    summary: Dict[str, Any]
+    transactions: List[Dict[str, Any]]
 
 
 # User Models
