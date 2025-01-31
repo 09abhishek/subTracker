@@ -1,4 +1,5 @@
 from decimal import Decimal
+from io import StringIO
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +10,7 @@ from typing import List, Annotated, Optional, Dict, Any
 import mysql.connector
 from mysql.connector import Error as MySQLError
 from pydantic import BaseModel
+from starlette.responses import StreamingResponse
 
 from app.config import REFRESH_TOKEN_EXPIRE_DAYS, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.db import get_db
@@ -1154,6 +1156,146 @@ async def get_transactions_by_date_range(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error: {str(e)}"
+        )
+    finally:
+        if cursor:
+            cursor.close()
+
+
+from fastapi.responses import StreamingResponse
+from io import StringIO
+
+from fastapi.responses import StreamingResponse
+from io import StringIO
+
+from fastapi.responses import StreamingResponse
+from io import StringIO
+
+from fastapi.responses import StreamingResponse
+from io import StringIO
+
+from fastapi.responses import StreamingResponse
+from io import StringIO
+
+
+@app.get("/export-ledger")
+async def export_ledger(
+        from_date: str = Query(..., description="Start date in DD/MM/YYYY format"),
+        to_date: str = Query(..., description="End date in DD/MM/YYYY format"),
+        current_user: dict = Depends(get_current_user),
+        db: mysql.connector.MySQLConnection = Depends(get_db)
+):
+    """
+    Generate a formatted ledger file from transactions within the specified date range.
+    Returns a downloadable .ledger file.
+    """
+    cursor = None
+    try:
+        # Convert dates to required format
+        try:
+            start_date = datetime.strptime(from_date, '%d/%m/%Y').strftime('%Y-%m-%d')
+            end_date = datetime.strptime(to_date, '%d/%m/%Y').strftime('%Y-%m-%d')
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid date format. Please use DD/MM/YYYY format"
+            )
+
+        cursor = db.cursor(dictionary=True)
+
+        # Get all transactions for the date range with category and account details
+        query = """
+            SELECT 
+                t.*,
+                c.name as category_name,
+                c.type as category_type,
+                ba.account_name,
+                ba.currency
+            FROM transactions t
+            JOIN categories c ON t.category_id = c.id
+            JOIN bank_accounts ba ON t.bank_account_id = ba.id
+            WHERE t.user_id = %s
+            AND t.date BETWEEN %s AND %s
+            ORDER BY t.date ASC, t.id ASC
+        """
+
+        cursor.execute(query, (current_user["id"], start_date, end_date))
+        transactions = cursor.fetchall()
+
+        if not transactions:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No transactions found for the specified date range"
+            )
+
+        # Generate ledger content
+        ledger_content = []
+        for tx in transactions:
+            # Format date in YYYY/MM/DD format
+            tx_date = tx['date'].strftime('%Y/%m/%d')
+
+            # Format description
+            description = tx['description']
+            max_desc_length = 50  # Maximum length for description on first line
+
+            # Create entry list
+            entry = []
+
+            # Handle description formatting
+            if len(description) > max_desc_length:
+                # First line with date and first part of description
+                entry.append(f"{tx_date} {description[:max_desc_length]}")
+                # Continue description on next line with proper indentation
+                remaining_desc = description[max_desc_length:]
+                entry.append(f"    {remaining_desc}")
+            else:
+                # Single line for date and description
+                entry.append(f"{tx_date} {description}")
+
+            # Format amount with thousand separator and decimal places
+            amount = abs(tx['amount'])
+            amount_str = f"₹{amount:,.2f}"
+
+            # Special handling for Cash Deposit transactions
+            if description.lower().startswith('cash deposit'):
+                bank_line = f"    Assets:Banking:{tx['account_name']}"
+                entry.append(f"{bank_line}{' ' * (80 - len(bank_line) - len(amount_str))}{amount_str}")
+                entry.append(f"    Income:Deposit")
+            else:
+                # Regular transaction handling
+                debit_line = f"    {tx['debit_account']}"
+                entry.append(f"{debit_line}{' ' * (80 - len(debit_line) - len(amount_str))}{amount_str}")
+                entry.append(f"    {tx['credit_account']}")
+
+            # Add empty line between transactions
+            entry.append("")
+            ledger_content.append("\n".join(entry))
+
+        # Combine all entries
+        full_ledger = "\n".join(ledger_content)
+
+        # Format the current date for the filename
+        file_date = datetime.now().strftime('%Y%m%d')
+        filename = f"transactions_{file_date}.ledger"
+
+        headers = {
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            'Access-Control-Expose-Headers': 'Content-Disposition',
+            'Content-Type': 'application/octet-stream'
+        }
+
+        # Return the response that will trigger browser download
+        return Response(
+            content=full_ledger,
+            headers=headers,
+            media_type="application/octet-stream"
+        )
+
+    except Exception as e:
+        logger.error(f"Error generating ledger file: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error generating ledger file: {str(e)}"
         )
     finally:
         if cursor:
