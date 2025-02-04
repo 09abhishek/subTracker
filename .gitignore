@@ -5,6 +5,6 @@
 __pycache__/
 *.pyc
 
-# Optional: If you want to ignore .iml or .xml files everywhere
+# Ignore .iml or .xml files everywhere
 *.iml
 *.xml
