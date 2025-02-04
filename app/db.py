@@ -1,6 +1,5 @@
-import uuid
 import os
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Response
+from fastapi import HTTPException, status
 import mysql.connector
 from mysql.connector import Error as MySQLError
 from dotenv import load_dotenv

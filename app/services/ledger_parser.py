@@ -1,14 +1,12 @@
 from datetime import datetime
 from decimal import Decimal
 from http.client import HTTPException
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Response
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import HTTPException, Depends, status
 import mysql.connector
 from app.db import get_db
 from app.logger import logger
-from app.category_matcher import CategoryMatcher
-from typing import List  # Add this for the list type hint
-from mysql.connector.cursor_cext import CMySQLCursor as MySQLCursor  # This is the concrete cursor class
+from mysql.connector.cursor_cext import CMySQLCursor as MySQLCursor
+from app.services.category_matcher import CategoryMatcher
 
 async def process_transactions(
         transactions: list,
